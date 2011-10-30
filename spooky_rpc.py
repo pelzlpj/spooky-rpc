@@ -1,36 +1,64 @@
+################################################################################
+# spooky_rpc
+#
+# Copyright (c) 2011 Paul Pelzl
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 
+#   Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+# 
+#   Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+################################################################################
+
 """
 spooky_rpc provides a generic framework for performing remote procedure calls
 over a filesystem transport.
 
 Lifetime of a Request
 ---------------------
-1) The SpookyClient writes requests to disk in a well-known directory.  Request
+1) The Client writes requests to disk in a well-known directory.  Request
    filenames are guaranteed to be unique, so that concurrent requests can be
    supported without risk of request collisions.  Files are first written to a
    temporary location and then renamed, so that the server never sees incomplete
    request data.
 
-2) The SpookyServer monitors the well-known request directory, and services
+2) The Server monitors the well-known request directory, and services
    new requests in creation-time order.  Each request is dispatched to the
-   user-provided RpcHandler implementation, which is invoked in a new process
-   to facilitate request pipelining.  If the RpcHandler provides a response,
-   the SpookyServer writes it back to disk in the location expected by the
-   client.
+   user-provided BinaryRequestHandler implementation, which is invoked in a new
+   process to facilitate request pipelining.  If the BinaryRequestHandler
+   provides a response, the Server writes it back to disk in the location
+   expected by the client.
 
-3) The SpookyClient optionally polls the expected response location, and
+3) The Client optionally polls the expected response location, and
    retrieves the payload when it becomes available.
 
 
 Caveats
 -------
-Each request is handled by invoking the RpcHandler.process_request() method
-in a new process.  Consequently, the RpcHandler implementation cannot
-assume that any program state is maintained between calls to process_request().
+* Each request is handled by invoking the BinaryRequestHandler.process_request()
+  method in a new process.  Consequently, the RequestHandler implementation
+  cannot assume that any changes in the program state are maintained across
+  multiple calls to process_request().
 """
 
-import errno, logging, multiprocessing, re, os, time, uuid
+import abc, errno, logging, multiprocessing, re, os, sys, time, unittest, uuid
 import Queue
-import binary_rpc as rpc
 
 
 MESSAGE_FILE_EXT   = '.msg'
@@ -39,8 +67,6 @@ MESSAGE_FILE_REGEX = re.compile(r'([0-9a-f]{32})' + re.escape(MESSAGE_FILE_EXT) 
 
 REQUEST_SUBDIR  = 'requests'
 RESPONSE_SUBDIR = 'responses'
-
-CLIENT_SLEEP_TIME = 0.1     # idle time between checking for an expected response
 
 
 def get_messages(path):
@@ -112,15 +138,15 @@ def handle_request(**kwargs):
 
     Keyword Arguments:
     ------------------
-    request_bytes : string
+    request_bytes : str/bytes
 
-        Request packet, serialized as a byte sequence.
+        Binary request packet.
 
     response_filename : string
 
         Path to file where response data should be stored.
 
-    handler : RpcHandler
+    handler : BinaryRequestHandler
 
         Client code for handling the request.
 
@@ -150,18 +176,65 @@ def init_subprocess(queue):
     handle_request.log_queue = queue
 
 
-class SpookyServer(object):
+class BinaryRequestHandler(object):
+    """This class shall be overridden to provide server-side logic for
+    processing requests.  The interface requires that requests and responses are
+    delivered in a binary format, so the implementation must take responsibility
+    for the serialization/deserialization work.
+    """
 
-    def __init__(self, io_error_response=None, process_count=None, **kwargs):
+    __metaclass__ = abc.ABCMeta
+
+    @abc.abstractmethod
+    def process_request(self, req):
+        """Perform the processing specified in the request data.
+
+        Exceptions shall not be raised.  If error conditions must be signalled, then
+        the binary response protocol must be designed to carry error information.
+
+        The implementation should not expect that any program state is maintained
+        across multiple invocations of process_request(); the caller may invoke
+        the method concurrently in separate processes.
+
+        Parameters:
+        -----------
+        req : str/bytes
+        
+            Binary request packet.
+
+        Returns:
+        --------
+        str/bytes or None
+
+            If the request packet requires a response, then the the return value
+            is the binary response packet; otherwise, None is returned.
+        """
+        return
+
+    @abc.abstractproperty
+    def io_error_response(self):
+        """Optional binary response packet which should be returned in the event
+        that the server cannot read an incoming request due to an I/O error.
+
+        Returns:
+        --------
+        str/bytes or None
+        """
+        return
+
+
+class Server(object):
+
+    def __init__(self, process_count=None, **kwargs):
         """Construct a new server instance.
 
         Keyword Arguments:
         ------------------
-        handler : RpcHandler
+        handler : BinaryRequestHandler
 
-            Provides the method for examining a request packet and taking
+            Provides the method for examining a binary request packet and taking
             action based on its content.
-
+ 
         directory : string
 
             Directory used for request and response storage.
@@ -170,22 +243,18 @@ class SpookyServer(object):
 
             Location where log file should be stored.
 
-        io_error_response : string or None
-
-            If provided, this byte sequence is returned as the response
-            in the event that an I/O error prevents the request from being
-            read correctly.
-
         process_count : int or None
             
             If provided, this is the count of subprocesses to use to service
             requests.  The default is to use the CPU count.
         """
-        self.handler           = kwargs['handler']
-        self.request_dir       = os.path.join(kwargs['directory'], REQUEST_SUBDIR)
-        self.response_dir      = os.path.join(kwargs['directory'], RESPONSE_SUBDIR)
-        self.log_filename      = kwargs['log_filename']
-        self.io_error_response = io_error_response
+        self.handler       = kwargs['handler']
+        self.request_dir   = os.path.join(kwargs['directory'], REQUEST_SUBDIR)
+        self.response_dir  = os.path.join(kwargs['directory'], RESPONSE_SUBDIR)
+        self.log_filename  = kwargs['log_filename']
+        self.process_count = process_count
+
+        assert isinstance(self.handler, BinaryRequestHandler)
 
         self.log = logging.getLogger('SpookyServer')
         self.log.setLevel(logging.DEBUG)
@@ -193,12 +262,6 @@ class SpookyServer(object):
         formatter = logging.Formatter(fmt='%(asctime)s: %(message)s')
         handler.setFormatter(formatter)
         self.log.addHandler(handler)
-
-        self.log_queue = multiprocessing.Queue()
-        self.pool = multiprocessing.Pool(
-            processes=process_count,
-            initializer=init_subprocess,
-            initargs=(self.log_queue,))
 
 
     def serve(self, poll_interval=1.0):
@@ -208,13 +271,21 @@ class SpookyServer(object):
         -----------
         poll_interval : float
 
-            Length of time to wait between checking for new requests.  Long intervals
-            will increase request/response latency, while very short intervals could
-            lead to unacceptable I/O activity on remote filesystems.
+            Length of time to wait between checking for new requests, in
+            seconds.  Long intervals will increase request/response latency,
+            while very short intervals could lead to unacceptable I/O activity
+            on remote filesystems.
         """
+        self.log.info('Server startup, listening at %s .' % self.request_dir)
         for (msg_filename, msg_id) in get_messages(self.request_dir):
-            print 'Deleting preexisting request %s...' % str(msg_id)
+            self.log.info('Deleting preexisting request %s...' % str(msg_id))
             try_remove(os.path.join(self.request_dir, msg_filename))
+
+        self.log_queue = multiprocessing.Queue()
+        self.pool = multiprocessing.Pool(
+            processes=self.process_count,
+            initializer=init_subprocess,
+            initargs=(self.log_queue,))
 
 
         while True:
@@ -248,8 +319,8 @@ class SpookyServer(object):
             self.log.error('Unable to read request \"%s\": %s' %
                 (request_filename, str(e)))
             try:
-                if self.io_error_response:
-                    write_file_with_subdirs(response_filename, self.io_error_response)
+                if self.handler.io_error_response is not None:
+                    write_file_with_subdirs(response_filename, self.handler.io_error_response)
             except EnvironmentError, e:
                 self.log.error('Unable to write io_error_response \"%s\": %s' %
                     (response_filename, str(e)))
@@ -264,7 +335,7 @@ class SpookyServer(object):
 
 
 
-class SpookyTimeoutError(Exception):
+class TimeoutError(Exception):
     """This exception is raised when a request timeout is exceeded.  The
     'id' attribute contains the identifier for the request which timed out.
     """
@@ -277,11 +348,11 @@ class SpookyTimeoutError(Exception):
 
 
 
-class SpookyClient(object):
+class Client(object):
 
     def __init__(self, directory):
         """Construct a new client instance, using the specified directory
-        for communication with a SpookyServer.
+        for communication with a Server.
         """
         self.request_dir  = os.path.join(directory, REQUEST_SUBDIR)
         self.response_dir = os.path.join(directory, RESPONSE_SUBDIR)
@@ -292,9 +363,9 @@ class SpookyClient(object):
 
         Parameters:
         -----------
-        request_bytes : string
+        request_bytes : str/bytes
 
-            Request packet, serialized as a byte sequence.
+            Binary request packet.
 
         Returns:
         --------
@@ -328,10 +399,10 @@ class SpookyClient(object):
 
         Returns:
         --------
-        string or None
+        str/bytes or None
 
-            Response packet, serialized as a byte sequence, or None if the
-            response is not yet available.
+            Binary response packet, or None if the response is not yet
+            available.
 
         Raises:
         -------
@@ -350,7 +421,7 @@ class SpookyClient(object):
                 raise
 
 
-    def wait_response(self, request_id, timeout=None):
+    def wait_response(self, request_id, timeout=0.0, poll_interval=0.1):
         """Wait for a response to arrive for the given request id.
 
         Parameters:
@@ -359,66 +430,74 @@ class SpookyClient(object):
 
             Identifier for a request, as provided by send_request_nowait().
 
-        timeout : float or None
+        timeout : float
 
-            Count of seconds to wait for the response to arrive, or None to wait
-            indefinitely.
+            If timeout > 0, then it specifies the maximum number of seconds to
+            wait for the response to arrive; otherwise, wait indefinitely.
+
+        poll_interval : float
+
+            Length of time to wait between response checks, in seconds.
 
         Returns:
         --------
-        string
+        str/bytes
 
-            Response packet, serialized as a byte sequence.
+            Binary response packet.
 
         Raises:
         -------
         EnvironmentError, if the response file is available but cannot be read.
 
-        SpookyTimeoutError, if the response was not received within the specified timeout
+        TimeoutError, if the response was not received within the specified timeout
         interval.
         """
         start_time = time.time()
         while True:
             result = self.check_response(request_id)
             if result is None:
-                if (timeout is not None) and (time.time() - start_time > timeout):
-                    raise SpookyTimeoutError(request_id)
-                time.sleep(CLIENT_SLEEP_TIME)
+                if timeout > 0.0 and (time.time() - start_time > timeout):
+                    raise TimeoutError(request_id)
+                time.sleep(poll_interval)
             else:
                 return result
 
 
-    def send_request_wait(self, request_bytes, timeout=None):
+    def send_request_wait(self, request_bytes, timeout=0.0, poll_interval=0.1):
         """Send a request packet to the server, waiting for a response.
 
         Parameters:
         -----------
-        request_bytes : string
+        request_bytes : str/bytes
 
-            Request packet, serialized as a byte sequence.
+            Binary request packet.
 
-        timeout : float or None
+        timeout : float
 
-            Count of seconds to wait for the response to arrive, or None to wait
-            indefinitely.
+            If timeout > 0, then it specifies the maximum number of seconds to
+            wait for the response to arrive; otherwise, wait indefinitely.
+
+        poll_interval : float
+
+            Length of time to wait between response checks, in seconds.
 
         Returns:
         --------
-        string
+        str/bytes
 
-            Response packet, serialized as a byte sequence.
+            Binary response packet.
 
         Raises:
         -------
         EnvironmentError, if the request could not be sent or the response could
         not be read.
 
-        SpookyTimeoutError, if the response was not received within the specified timeout
+        TimeoutError, if the response was not received within the specified timeout
         interval.  (The identifier for the failed request can be retrieved from the
         exception.)
         """
         request_id = self.send_request_nowait(request_bytes)
-        return self.wait_response(request_id, timeout)
+        return self.wait_response(request_id, timeout, poll_interval)
 
 
     def purge_responses(self):
@@ -442,10 +521,115 @@ class SpookyClient(object):
         return result
 
 
+################################################################################
+# UNIT TESTS
+################################################################################
+
+REQ_NOOP   = '\x00'  # Ask server to do nothing
+REQ_PING   = '\x01'  # Ask server to immediately respond
+REQ_SLEEP3 = '\x02'  # Ask server to idle for 3 sec before responding
+
+RESP_BAD_DATA = '\xfe'
+RESP_IO_ERROR = '\xff'
+
+TEST_DIR = 'spooky_test_dir'
+
+class TestHandler(BinaryRequestHandler):
+
+    def process_request(self, req):
+        if req == REQ_NOOP:
+            sys.stdout.write('received noop\n')
+            return None
+        elif req == REQ_PING:
+            sys.stdout.write('received ping\n')
+            return REQ_PING
+        elif req == REQ_SLEEP3:
+            sys.stdout.write('received sleep(3)\n')
+            time.sleep(3.0)
+            return REQ_SLEEP3
+        else:
+            sys.stdout.write('received unhandled bytes: %s' % req.encode('hex'))
+            return RESP_BAD_DATA
+
+    def io_error_response(self):
+        return RESP_IO_ERROR
+
+
+def start_test_server():
+    server = Server(
+        handler=TestHandler(),
+        directory=TEST_DIR,
+        log_filename='test-server.log',
+        process_count=16)
+    server.serve()
+
+
+class SpookyTests(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls._proc = multiprocessing.Process(target=start_test_server)
+        cls._proc.start()
+        cls._client = Client(TEST_DIR)
+        cls._client.purge_responses()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._proc.terminate()
+        cls._proc.join()
+            
+    def test_noop(self):
+        req_id = self._client.send_request_nowait(REQ_NOOP)
+        self.assertTrue(isinstance(req_id, uuid.UUID),
+            msg='send_request_nowait() shall return a UUID')
+
+    def test_ping(self):
+        response = self._client.send_request_wait(REQ_PING)
+        self.assertEqual(response, REQ_PING,
+            msg=('unexpected response received from REQ_PING: 0x%s' % response.encode('hex')))
+
+    def test_timeout_exceeded(self):
+        req_id = self._client.send_request_nowait(REQ_SLEEP3)
+        try:
+            response = self._client.wait_response(req_id, 1.0)
+            assert False, 'received response when timeout was expected'
+        except TimeoutError:
+            response = self._client.wait_response(req_id)
+            self.assertEqual(response, REQ_SLEEP3,
+                msg=('unexpected response after REQ_SLEEP3: 0x%s' % response.encode('hex')))
+
+    def test_timeout_not_exceeded(self):
+        response = self._client.send_request_wait(REQ_SLEEP3, 5.0)
+        self.assertEqual(response, REQ_SLEEP3,
+            msg=('unexpected response after REQ_SLEEP3: 0x%s' % response.encode('hex')))
+
+    def test_concurrent_requests(self):
+        # Eight concurrent requests, each of which should sleep for 3 sec
+        request_ids = [self._client.send_request_nowait(REQ_SLEEP3) for i in range(8)]
+        time.sleep(4.0)
+        # All requests should now be complete
+        for id in request_ids:
+            self.assertEqual(self._client.check_response(id), REQ_SLEEP3)
+
+    def test_orphan_responses(self):
+        request_ids = [self._client.send_request_nowait(REQ_PING) for i in range(5)]
+        time.sleep(2.0)
+        orphan_ids = self._client.purge_responses()
+        self.assertEqual(set(request_ids), set(orphan_ids),
+            msg=('purge_responses() removed unexpected set of responses'))
+
+
+if __name__ == '__main__':
+    (major, minor, x, y, z) = sys.version_info
+    assert major == 2 and minor >= 7, 'Unit tests require Python 2.7.'
+    unittest.main()
+
 
 __all__ = [
-    'SpookyServer',
-    'SpookyClient'
+    'BinaryRequestHandler',
+    'Server',
+    'Client',
+    'TimeoutError'
 ]
 
 
