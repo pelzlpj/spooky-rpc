@@ -28,8 +28,12 @@ class TestHandler(RpcHandler):
 
 
 if __name__ == '__main__':
-    handler = TestHandler()
-    server = SpookyServer(handler, 'spooky_test_dir', '\xff')
+    server = SpookyServer(
+        handler=TestHandler(),
+        directory='spooky_test_dir',
+        log_filename='test-server.log',
+        io_error_response='\xff',
+        process_count=16)
     server.serve()
 
 

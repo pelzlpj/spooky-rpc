@@ -12,6 +12,10 @@ class RpcHandler(object):
         Exceptions shall not be raised.  If error conditions must be signalled, then
         the binary response protocol must be designed to carry error information.
 
+        The implementation should not expect that any program state is maintained
+        across multiple invocations of process_request(); the caller may invoke
+        the method concurrently in separate processes.
+
         Parameters:
         -----------
         req : string

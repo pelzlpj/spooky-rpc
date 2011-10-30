@@ -19,9 +19,17 @@ Lifetime of a Request
 
 3) The SpookyClient optionally polls the expected response location, and
    retrieves the payload when it becomes available.
+
+
+Caveats
+-------
+Each request is handled by invoking the RpcHandler.process_request() method
+in a new process.  Consequently, the RpcHandler implementation cannot
+assume that any program state is maintained between calls to process_request().
 """
 
-import errno, logging, re, os, time, uuid
+import errno, logging, multiprocessing, re, os, time, uuid
+import Queue
 import binary_rpc as rpc
 
 
@@ -98,13 +106,57 @@ def write_file_with_subdirs(filename, content):
     fancy_rename(tmp_filename, filename)
 
 
+def handle_request(**kwargs):
+    """Handle a request.  (This function is invoked as the target for
+    multiprocessing.Process().)
+
+    Keyword Arguments:
+    ------------------
+    request_bytes : string
+
+        Request packet, serialized as a byte sequence.
+
+    response_filename : string
+
+        Path to file where response data should be stored.
+
+    handler : RpcHandler
+
+        Client code for handling the request.
+
+    Attributes:
+    -----------
+    log_queue : multiprocessing.Queue
+
+        Queue to which error strings should be sent.  (This is a hack.  When
+        using multiprocess.Pool, queues cannot be passed as function arguments;
+        they must be passed in the process initializer.)
+
+    """
+    request_bytes     = kwargs['request_bytes']
+    response_filename = kwargs['response_filename']
+    handler           = kwargs['handler']
+
+    response_bytes = handler.process_request(request_bytes)
+    if response_bytes:
+        try:
+            write_file_with_subdirs(response_filename, response_bytes)
+        except EnvironmentError, e:
+            handle_request.log_queue.put(
+                'Unable to write response \"%s\": %s' % (response_filename, str(e)))
+
+
+def init_subprocess(queue):
+    handle_request.log_queue = queue
+
+
 class SpookyServer(object):
 
-    def __init__(self, handler, directory, io_error_response=None):
+    def __init__(self, io_error_response=None, process_count=None, **kwargs):
         """Construct a new server instance.
 
-        Parameters:
-        -----------
+        Keyword Arguments:
+        ------------------
         handler : RpcHandler
 
             Provides the method for examining a request packet and taking
@@ -112,22 +164,41 @@ class SpookyServer(object):
 
         directory : string
 
-            Directory used for request and response storage
+            Directory used for request and response storage.
+
+        log_filename : string
+
+            Location where log file should be stored.
 
         io_error_response : string or None
 
             If provided, this byte sequence is returned as the response
             in the event that an I/O error prevents the request from being
             read correctly.
+
+        process_count : int or None
+            
+            If provided, this is the count of subprocesses to use to service
+            requests.  The default is to use the CPU count.
         """
-        self.handler           = handler
-        self.request_dir       = os.path.join(directory, REQUEST_SUBDIR)
-        self.response_dir      = os.path.join(directory, RESPONSE_SUBDIR)
+        self.handler           = kwargs['handler']
+        self.request_dir       = os.path.join(kwargs['directory'], REQUEST_SUBDIR)
+        self.response_dir      = os.path.join(kwargs['directory'], RESPONSE_SUBDIR)
+        self.log_filename      = kwargs['log_filename']
         self.io_error_response = io_error_response
 
         self.log = logging.getLogger('SpookyServer')
         self.log.setLevel(logging.DEBUG)
-        self.log.addHandler(logging.FileHandler('spooky-server.log'))
+        handler = logging.FileHandler(self.log_filename)
+        formatter = logging.Formatter(fmt='%(asctime)s: %(message)s')
+        handler.setFormatter(formatter)
+        self.log.addHandler(handler)
+
+        self.log_queue = multiprocessing.Queue()
+        self.pool = multiprocessing.Pool(
+            processes=process_count,
+            initializer=init_subprocess,
+            initargs=(self.log_queue,))
 
 
     def serve(self, poll_interval=1.0):
@@ -147,39 +218,49 @@ class SpookyServer(object):
 
 
         while True:
+            # Check for any logging messages from subprocesses
+            try:
+                while True:
+                    subprocess_error = self.log_queue.get_nowait()
+                    self.log.error(subprocess_error)
+            except Queue.Empty:
+                pass
+
             is_message_processed = False
             for (f, req_id) in get_messages(self.request_dir):
                 is_message_processed = True
-                request_filename  = os.path.join(self.request_dir, f)
-                response_filename = os.path.join(self.response_dir, f)
-
-                try:
-                    with open(request_filename, 'rb') as request_file:
-                        request_bytes = request_file.read()
-                except EnvironmentError, e:
-                    self.log.error('Unable to read request \"%s\": %s' %
-                        (request_filename, str(e)))
-                    try:
-                        if self.io_error_response:
-                            write_file_with_subdirs(response_filename, self.io_error_response)
-                    except EnvironmentError, e:
-                        self.log.error('Unable to write io_error_response \"%s\": %s' %
-                            (response_filename, str(e)))
-                    continue
-
-                response_bytes = self.handler.process_request(request_bytes)
-                try_remove(request_filename)
-
-                try:
-                    if response_bytes:
-                        write_file_with_subdirs(response_filename, response_bytes)
-                except EnvironmentError, e:
-                    self.log.error('Unable to write response \"%s\": %s' %
-                        (response_filename, str(e)))
+                self._serve_one(f, req_id)
 
             # Don't sleep unless there was no work available
             if not is_message_processed:
                 time.sleep(poll_interval)
+
+
+    def _serve_one(self, msg_filename, req_id):
+        """Service a single request."""
+        request_filename  = os.path.join(self.request_dir, msg_filename)
+        response_filename = os.path.join(self.response_dir, msg_filename)
+
+        try:
+            with open(request_filename, 'rb') as request_file:
+                request_bytes = request_file.read()
+        except EnvironmentError, e:
+            self.log.error('Unable to read request \"%s\": %s' %
+                (request_filename, str(e)))
+            try:
+                if self.io_error_response:
+                    write_file_with_subdirs(response_filename, self.io_error_response)
+            except EnvironmentError, e:
+                self.log.error('Unable to write io_error_response \"%s\": %s' %
+                    (response_filename, str(e)))
+            return
+        try_remove(request_filename)
+
+        self.pool.apply_async(handle_request, (), {
+                'request_bytes'     : request_bytes,
+                'response_filename' : response_filename,
+                'handler'           : self.handler,
+            })
 
 
 
