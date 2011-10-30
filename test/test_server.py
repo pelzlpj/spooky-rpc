@@ -1,3 +1,10 @@
+import os, sys
+
+module_folder = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if module_folder not in sys.path:
+    sys.path.append(module_folder)
+
+
 import time
 from binary_rpc import RpcHandler
 from spooky_rpc import SpookyServer

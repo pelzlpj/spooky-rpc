@@ -1,3 +1,9 @@
+import os, sys
+
+module_folder = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if module_folder not in sys.path:
+    sys.path.append(module_folder)
+
 
 import time
 from spooky_rpc import SpookyClient, SpookyTimeoutError
@@ -29,9 +35,9 @@ def test():
     request_ids = [client.send_request_nowait('\x01') for i in range(5)]
     print 'request_ids: %s' % repr(request_ids)
     time.sleep(5.0)
-    orphan_ids = client.clean_orphan_responses()
+    orphan_ids = client.purge_responses()
     try:
-        assert request_ids == orphan_ids
+        assert set(request_ids) == set(orphan_ids)
     except AssertionError:
         print 'orphan_ids: %s' % repr(orphan_ids)
         raise

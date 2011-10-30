@@ -1,58 +1,81 @@
-import errno, logging, re, os, time
+"""
+spooky_rpc provides a generic framework for performing remote procedure calls
+over a filesystem transport.
+
+Lifetime of a Request
+---------------------
+1) The SpookyClient writes requests to disk in a well-known directory.  Request
+   filenames are guaranteed to be unique, so that concurrent requests can be
+   supported without risk of request collisions.  Files are first written to a
+   temporary location and then renamed, so that the server never sees incomplete
+   request data.
+
+2) The SpookyServer monitors the well-known request directory, and services
+   new requests in creation-time order.  Each request is dispatched to the
+   user-provided RpcHandler implementation, which is invoked in a new process
+   to facilitate request pipelining.  If the RpcHandler provides a response,
+   the SpookyServer writes it back to disk in the location expected by the
+   client.
+
+3) The SpookyClient optionally polls the expected response location, and
+   retrieves the payload when it becomes available.
+"""
+
+import errno, logging, re, os, time, uuid
 import binary_rpc as rpc
 
 
-MESSAGE_FILE_REGEX  = re.compile(r'(\d{8})\.msg$')
-MESSAGE_FILE_FORMAT = '%08d.msg'
+MESSAGE_FILE_EXT   = '.msg'
+PARTIAL_FILE_EXT   = '.part'
+MESSAGE_FILE_REGEX = re.compile(r'([0-9a-f]{32})' + re.escape(MESSAGE_FILE_EXT) + '$')
 
-FAILURE_EXT     = '.fail'
 REQUEST_SUBDIR  = 'requests'
 RESPONSE_SUBDIR = 'responses'
 
-SERVER_SLEEP_TIME = 1.0     # idle time between checking for new requests
 CLIENT_SLEEP_TIME = 0.1     # idle time between checking for an expected response
 
 
 def get_messages(path):
-    """Returns: ordered list of (message_filename, message_generation_count) contained
-    in the given path."""
+    """Get a list of (message_filename, message_id) for messages found the given path.
+    The list is returned in message_mtime order.
+    """
     try:
         all_files = os.listdir(path)
     except OSError:
         return []
 
-    all_files.sort()
-
-    result = []
+    items = []
     for f in all_files:
         m = MESSAGE_FILE_REGEX.match(f)
         if m:
-            result.append( (f, int(m.group(1))) )
-    return result
+            fq_file = os.path.join(path, f)
+            try:
+                st = os.stat(fq_file)
+                items.append( (f, uuid.UUID(hex=m.group(1)), st.st_mtime) )
+            except OSError:
+                pass
+    items.sort(key=lambda (x, y, mtime): mtime)
+
+    return [(filename, id) for (filename, id, mtime) in items]
 
 
-def get_generation_count(path):
-    """Compute the largest message index of all messages in the given path.
-    If there are no messages, the result is 0.
-
-    Returns: int
-    """
-    try:
-        (filename, gen_count) = get_messages(path)[-1]
-    except IndexError:
-        return 0
-    return gen_count
-
-
-def make_msg_filename(gen_count):
-    """Constructs a message filename which bears the given generation count."""
-    return MESSAGE_FILE_FORMAT % gen_count
+def make_msg_filename(message_id):
+    """Constructs a message filename from the given message id."""
+    return message_id.hex + MESSAGE_FILE_EXT
 
 
 def try_remove(path):
     """Remove a file, ignoring errors."""
     try:
         os.remove(path)
+    except OSError:
+        pass
+
+
+def try_makedirs(directory):
+    """Tries to create all components of the given directory, ignoring errors."""
+    try:
+        os.makedirs(directory)
     except OSError:
         pass
 
@@ -65,14 +88,11 @@ def fancy_rename(src, dst):
 
 def write_file_with_subdirs(filename, content):
     """Write a file, creating any intermediate subdirectories."""
-    try:
-        os.makedirs(os.path.dirname(filename))
-    except OSError:
-        pass
+    try_makedirs(os.path.dirname(filename))
     
     # We don't want the recipient to see partial messages, so
     # we write to a tempfile and then rename when done.
-    tmp_filename = filename + ".part"
+    tmp_filename =  filename + PARTIAL_FILE_EXT
     with open(tmp_filename, 'wb') as f:
         f.write(content)
     fancy_rename(tmp_filename, filename)
@@ -121,42 +141,41 @@ class SpookyServer(object):
             will increase request/response latency, while very short intervals could
             lead to unacceptable I/O activity on remote filesystems.
         """
+        for (msg_filename, msg_id) in get_messages(self.request_dir):
+            print 'Deleting preexisting request %s...' % str(msg_id)
+            try_remove(os.path.join(self.request_dir, msg_filename))
 
-        self.generation = get_generation_count(self.request_dir)
 
         while True:
             is_message_processed = False
-            for (f, gen_count) in get_messages(self.request_dir):
+            for (f, req_id) in get_messages(self.request_dir):
+                is_message_processed = True
                 request_filename  = os.path.join(self.request_dir, f)
                 response_filename = os.path.join(self.response_dir, f)
 
-                if gen_count < self.generation:
-                    # We only need to keep one old request file around to preserve the gen count
-                    try_remove(request_filename)
-                elif gen_count > self.generation:
-                    is_message_processed = True
-                    self.generation = gen_count
+                try:
+                    with open(request_filename, 'rb') as request_file:
+                        request_bytes = request_file.read()
+                except EnvironmentError, e:
+                    self.log.error('Unable to read request \"%s\": %s' %
+                        (request_filename, str(e)))
                     try:
-                        with open(request_filename, 'rb') as request_file:
-                            request_bytes = request_file.read()
+                        if self.io_error_response:
+                            write_file_with_subdirs(response_filename, self.io_error_response)
                     except EnvironmentError, e:
-                        self.log.error('Unable to read request \"%s\": %s' %
-                            (request_filename, str(e)))
-                        try:
-                            if self.io_error_response:
-                                write_file_with_subdirs(response_filename, self.io_error_response)
-                        except EnvironmentError, e:
-                            self.log.error('Unable to write io_error_response \"%s\": %s' %
-                                (response_filename, str(e)))
-                        continue
-
-                    response_bytes = self.handler.process_request(request_bytes)
-                    try:
-                        if response_bytes:
-                            write_file_with_subdirs(response_filename, response_bytes)
-                    except EnvironmentError, e:
-                        self.log.error('Unable to write response \"%s\": %s' %
+                        self.log.error('Unable to write io_error_response \"%s\": %s' %
                             (response_filename, str(e)))
+                    continue
+
+                response_bytes = self.handler.process_request(request_bytes)
+                try_remove(request_filename)
+
+                try:
+                    if response_bytes:
+                        write_file_with_subdirs(response_filename, response_bytes)
+                except EnvironmentError, e:
+                    self.log.error('Unable to write response \"%s\": %s' %
+                        (response_filename, str(e)))
 
             # Don't sleep unless there was no work available
             if not is_message_processed:
@@ -173,7 +192,7 @@ class SpookyTimeoutError(Exception):
         self.id = value
 
     def __str__(self):
-        return 'Timeout exceeded for request id %u.' % self.id
+        return 'Timeout exceeded for request id %s.' % str(self.id)
 
 
 
@@ -198,7 +217,7 @@ class SpookyClient(object):
 
         Returns:
         --------
-        int
+        UUID
 
             Request identifier, intended for use with check_response() or
             wait_response().
@@ -207,10 +226,10 @@ class SpookyClient(object):
         -------
         EnvironmentError, if the request could not be sent
         """
-        next_gen_count = self._get_generation_count() + 1
-        msg_filename   = os.path.join(self.request_dir, make_msg_filename(next_gen_count))
-        write_file_with_subdirs(msg_filename, request_bytes)
-        return next_gen_count
+        request_id       = uuid.uuid1()
+        request_filename = os.path.join(self.request_dir, make_msg_filename(request_id))
+        write_file_with_subdirs(request_filename, request_bytes)
+        return request_id
 
 
     def check_response(self, request_id):
@@ -222,7 +241,7 @@ class SpookyClient(object):
 
         Parameters:
         -----------
-        request_id : int
+        request_id : UUID
 
             Identifier for a request, as provided by send_request_nowait().
 
@@ -237,7 +256,7 @@ class SpookyClient(object):
         -------
         EnvironmentError, if a response file is available but cannot be read.
         """
-        response_file  = os.path.join(self.response_dir, make_msg_filename(request_id))
+        response_file = os.path.join(self.response_dir, make_msg_filename(request_id))
         try:
             with open(response_file, 'rb') as f:
                 response_bytes = f.read()
@@ -317,46 +336,30 @@ class SpookyClient(object):
         interval.  (The identifier for the failed request can be retrieved from the
         exception.)
         """
-        return self.wait_response(self.send_request_nowait(request_bytes), timeout)
+        request_id = self.send_request_nowait(request_bytes)
+        return self.wait_response(request_id, timeout)
 
 
-    def clean_orphan_responses(self):
-        """Delete any stale response files.
+    def purge_responses(self):
+        """Delete all response files.
 
-        In general, response files will fail to be deleted whenever the client does not
-        wait for them.  This will occur, for example, if send_request_wait() times out
-        or if the client invokes send_request_nowait() without polling check_response()
-        until the response is received.
+        In general, response files will fail to be automatically deleted whenever the
+        client does not wait for them.  This will occur, for example, if
+        send_request_wait() times out or if the client invokes send_request_nowait()
+        without polling check_response() until the response is received.
 
         Returns:
         --------
-        list of int
+        list of UUID
 
-            List of orphaned request ids which were removed.
+            List of request ids corresponding to the deleted response messages.
         """
         result = []
-        for (msg, gen_count) in get_messages(self.response_dir):
-            try_remove(os.path.join(self.response_dir, msg))
-            result.append(gen_count)
+        for (msg_filename, msg_id) in get_messages(self.response_dir):
+            try_remove(os.path.join(self.response_dir, msg_filename))
+            result.append(msg_id)
         return result
 
-
-    def _write_request(self, request_bytes):
-        """Write a request packet.
-
-        Returns: new generation count for the request.
-        """
-
-
-    def _get_generation_count(self):
-        """Get the generation count.
-
-        The client takes responsibility for setting a generation count which
-        will be unambiguous for both client and server.  This is why both the
-        request and response messages need to be examined.
-        """
-        return max(get_generation_count(self.request_dir),
-                    get_generation_count(self.response_dir))
 
 
 __all__ = [
