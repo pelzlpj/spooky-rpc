@@ -137,9 +137,15 @@ def atomic_write_file(filename, content):
 
     # We don't want the recipient to see partial messages, so
     # we write to a tempfile and then rename when done.
-    tmp_filename =  filename + PARTIAL_FILE_EXT
-    with open(tmp_filename, 'wb') as f:
-        f.write(content)
+    tmp_filename = filename + PARTIAL_FILE_EXT
+    try:
+        with open(tmp_filename, 'wb') as f:
+            f.write(content)
+    except BaseException:
+        # If something goes wrong, or if the process gets killed, try to
+        # avoid leaving the partially-written file sitting on disk.
+        try_remove(tmp_filename)
+        raise
     posixish_rename(tmp_filename, filename)
 
 
@@ -637,12 +643,13 @@ class SpookyTests(unittest.TestCase):
     def test_concurrent_requests(self):
         # Eight concurrent requests, each of which should sleep for 3 sec
         request_ids = [self._client.send_request_nowait(REQ_SLEEP3) for i in range(8)]
-        time.sleep(4.0)
+        time.sleep(5.0)
         # All requests should now be complete
         for id in request_ids:
             self.assertEqual(self._client.check_response(id), REQ_SLEEP3)
 
     def test_orphan_responses(self):
+        self._client.purge_responses()
         request_ids = [self._client.send_request_nowait(REQ_PING) for i in range(5)]
         time.sleep(2.0)
         orphan_ids = self._client.purge_responses()
