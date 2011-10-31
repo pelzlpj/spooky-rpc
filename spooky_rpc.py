@@ -65,13 +65,15 @@ VERSION = '1.0.0'
 MESSAGE_FILE_EXT   = '.msg'
 PARTIAL_FILE_EXT   = '.part'
 MESSAGE_FILE_REGEX = re.compile(r'([0-9a-f]{32})' + re.escape(MESSAGE_FILE_EXT) + '$')
+PARTIAL_FILE_REGEX = re.compile(r'([0-9a-f]{32})' +
+        re.escape(MESSAGE_FILE_EXT) + re.escape(PARTIAL_FILE_EXT) + '$')
 
 REQUEST_SUBDIR  = 'requests'
 RESPONSE_SUBDIR = 'responses'
 
 
 def get_messages(path):
-    """Get a list of (message_filename, message_id) for messages found the given path.
+    """Get a list of (message_filename, message_id) for messages found in the given path.
     The list is returned in message_mtime order.
     """
     try:
@@ -92,6 +94,23 @@ def get_messages(path):
     items.sort(key=lambda item: item[2])
 
     return [(filename, id) for (filename, id, mtime) in items]
+
+
+def get_partial_messages(path):
+    """Get a list of (message_filename, message_id) for partially-written messages
+    found in the given path.
+    """
+    try:
+        all_files = os.listdir(path)
+    except OSError:
+        return []
+
+    items = []
+    for f in all_files:
+        m = PARTIAL_FILE_REGEX.match(f)
+        if m:
+            items.append( (f, uuid.UUID(hex=m.group(1))) )
+    return items
 
 
 def make_msg_filename(message_id):
@@ -137,9 +156,15 @@ def atomic_write_file(filename, content):
 
     # We don't want the recipient to see partial messages, so
     # we write to a tempfile and then rename when done.
-    tmp_filename =  filename + PARTIAL_FILE_EXT
-    with open(tmp_filename, 'wb') as f:
-        f.write(content)
+    tmp_filename = filename + PARTIAL_FILE_EXT
+    try:
+        with open(tmp_filename, 'wb') as f:
+            f.write(content)
+    except BaseException:
+        # If something goes wrong, or if the process gets killed, try to
+        # avoid leaving the partially-written file sitting on disk.
+        try_remove(tmp_filename)
+        raise
     posixish_rename(tmp_filename, filename)
 
 
@@ -289,6 +314,9 @@ class Server(object):
         for (msg_filename, msg_id) in get_messages(self.request_dir):
             self.log.info('Deleting preexisting request %s...' % str(msg_id))
             try_remove(os.path.join(self.request_dir, msg_filename))
+        for (msg_filename, msg_id) in get_partial_messages(self.response_dir):
+            self.log.info('Deleting preexisting partial response %s...' % str(msg_id))
+            try_remove(os.path.join(self.response_dir, msg_filename))
 
         self.log_queue = multiprocessing.Queue()
         self.pool = multiprocessing.Pool(
@@ -296,6 +324,7 @@ class Server(object):
             initializer=init_subprocess,
             initargs=(self.log_queue,))
 
+        self.ignored_requests = set()
 
         while True:
             # Check for any logging messages from subprocesses
@@ -308,8 +337,9 @@ class Server(object):
 
             is_message_processed = False
             for (f, req_id) in get_messages(self.request_dir):
-                is_message_processed = True
-                self._serve_one(f, req_id)
+                if req_id not in self.ignored_requests:
+                    is_message_processed = True
+                    self._serve_one(f, req_id)
 
             # Don't sleep unless there was no work available
             if not is_message_processed:
@@ -334,7 +364,17 @@ class Server(object):
                 self.log.error('Unable to write io_error_response \"%s\": %s' %
                     (response_filename, str(e)))
             return
-        try_remove(request_filename)
+        finally:
+            # Try to clean up the request.  The request is considered "handled"
+            # even if something went wrong and we couldn't actually service it.
+            try:
+                os.remove(request_filename)
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    self.log.info(
+                        'Unable to remove completed request %s; adding to ignore list.' %
+                        str(req_id))
+                    self.ignored_requests.add(req_id)
 
         self.pool.apply_async(handle_request, (), {
                 'request_bytes'     : request_bytes,
@@ -509,25 +549,48 @@ class Client(object):
         return self.wait_response(request_id, timeout, poll_interval)
 
 
-    def purge_responses(self):
-        """Delete all response files.
+    def purge_orphans(self):
+        """Delete all partially-written request files, and all (completely-written)
+        response files.  (This is probably not appropriate unless you have
+        reason to believe that there are no other client processes running
+        concurrently.)
 
-        In general, response files will fail to be automatically deleted whenever the
-        client does not wait for them.  This will occur, for example, if
-        send_request_wait() times out or if the client invokes send_request_nowait()
-        without polling check_response() until the response is received.
+        Request files may be left in a partially-written state whenever a client
+        process terminates unexpectedly.
+
+        Orphaned response files can be created more easily; responses will fail
+        to be automatically deleted whenever the client does not wait for them.
+        This will occur, for example, if send_request_wait() times out or if the
+        client invokes send_request_nowait() without polling check_response()
+        until the response is received.
 
         Returns:
         --------
-        list of UUID
+        (list of UUID, list of UUID)
 
-            List of request ids corresponding to the deleted response messages.
+            The first element is the list of request ids corresponding to the
+            partially-written requests which were deleted.
+
+            The second element is the list of request ids corresponding to the
+            stale response files which were deleted.
         """
-        result = []
+        partial_requests = []
+        for (msg_filename, msg_id) in get_partial_messages(self.request_dir):
+            try:
+                os.remove(os.path.join(self.request_dir, msg_filename))
+                partial_requests.append(msg_id)
+            except OSError:
+                pass
+
+        stale_responses = []
         for (msg_filename, msg_id) in get_messages(self.response_dir):
-            try_remove(os.path.join(self.response_dir, msg_filename))
-            result.append(msg_id)
-        return result
+            try:
+                os.remove(os.path.join(self.response_dir, msg_filename))
+                stale_responses.append(msg_id)
+            except OSError:
+                pass
+
+        return (partial_requests, stale_responses)
 
 
 ################################################################################
@@ -560,8 +623,10 @@ class TestHandler(BinaryRequestHandler):
             sys.stdout.write('received unhandled bytes: 0x%s' % binascii.hexlify(req))
             return RESP_BAD_DATA
 
-    def io_error_response(self):
+    def _get_io_error_response(self):
         return RESP_IO_ERROR
+
+    io_error_response = property(_get_io_error_response)
 
 
 def start_test_server():
@@ -580,7 +645,7 @@ class SpookyTests(unittest.TestCase):
         cls._proc = multiprocessing.Process(target=start_test_server)
         cls._proc.start()
         cls._client = Client(TEST_DIR)
-        cls._client.purge_responses()
+        cls._client.purge_orphans()
 
     @classmethod
     def tearDownClass(cls):
@@ -612,18 +677,35 @@ class SpookyTests(unittest.TestCase):
         self.assertEqual(response, REQ_SLEEP3,
             msg=('unexpected response after REQ_SLEEP3: 0x%s' % binascii.hexlify(response)))
 
+    def test_io_error_response(self):
+        # Create a request in the correct location, but make it write-only.  The server
+        # will see that the request is present, but won't be able to read it.
+        req_id = uuid.uuid1()
+        req_filename = os.path.join(self._client.request_dir, make_msg_filename(req_id))
+        try_makedirs(os.path.dirname(req_filename))
+
+        win_flags = os.O_BINARY if sys.platform == 'win32' else 0
+        fd = os.open(req_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | win_flags, 0o200)
+        try:
+            os.write(fd, REQ_PING)
+        finally:
+            os.close(fd)
+        response = self._client.wait_response(req_id)
+        self.assertEqual(response, RESP_IO_ERROR)
+
     def test_concurrent_requests(self):
         # Eight concurrent requests, each of which should sleep for 3 sec
         request_ids = [self._client.send_request_nowait(REQ_SLEEP3) for i in range(8)]
-        time.sleep(4.0)
+        time.sleep(5.0)
         # All requests should now be complete
         for id in request_ids:
             self.assertEqual(self._client.check_response(id), REQ_SLEEP3)
 
     def test_orphan_responses(self):
+        self._client.purge_orphans()
         request_ids = [self._client.send_request_nowait(REQ_PING) for i in range(5)]
         time.sleep(2.0)
-        orphan_ids = self._client.purge_responses()
+        (_, orphan_ids) = self._client.purge_orphans()
         self.assertEqual(set(request_ids), set(orphan_ids),
             msg=('purge_responses() removed unexpected set of responses'))
 
