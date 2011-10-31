@@ -336,7 +336,9 @@ class Server(object):
                 self.log.error('Unable to write io_error_response \"%s\": %s' %
                     (response_filename, str(e)))
             return
-        try_remove(request_filename)
+        finally:
+            # The request has been dealt with, even if we couldn't read it.
+            try_remove(request_filename)
 
         self.pool.apply_async(handle_request, (), {
                 'request_bytes'     : request_bytes,
@@ -562,8 +564,10 @@ class TestHandler(BinaryRequestHandler):
             sys.stdout.write('received unhandled bytes: 0x%s' % binascii.hexlify(req))
             return RESP_BAD_DATA
 
-    def io_error_response(self):
+    def _get_io_error_response(self):
         return RESP_IO_ERROR
+
+    io_error_response = property(_get_io_error_response)
 
 
 def start_test_server():
@@ -613,6 +617,22 @@ class SpookyTests(unittest.TestCase):
         response = self._client.send_request_wait(REQ_SLEEP3, 5.0)
         self.assertEqual(response, REQ_SLEEP3,
             msg=('unexpected response after REQ_SLEEP3: 0x%s' % binascii.hexlify(response)))
+
+    def test_io_error_response(self):
+        # Create a request in the correct location, but make it write-only.  The server
+        # will see that the request is present, but won't be able to read it.
+        req_id = uuid.uuid1()
+        req_filename = os.path.join(self._client.request_dir, make_msg_filename(req_id))
+        try_makedirs(os.path.dirname(req_filename))
+
+        win_flags = os.O_BINARY if sys.platform == 'win32' else 0
+        fd = os.open(req_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | win_flags, 0200)
+        try:
+            os.write(fd, REQ_PING)
+        finally:
+            os.close(fd)
+        response = self._client.wait_response(req_id)
+        self.assertEqual(response, RESP_IO_ERROR)
 
     def test_concurrent_requests(self):
         # Eight concurrent requests, each of which should sleep for 3 sec
