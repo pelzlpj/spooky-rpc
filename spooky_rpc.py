@@ -326,6 +326,7 @@ class Server(object):
             initializer=init_subprocess,
             initargs=(self.log_queue,))
 
+        self.ignored_requests = set()
 
         while True:
             # Check for any logging messages from subprocesses
@@ -338,8 +339,9 @@ class Server(object):
 
             is_message_processed = False
             for (f, req_id) in get_messages(self.request_dir):
-                is_message_processed = True
-                self._serve_one(f, req_id)
+                if req_id not in self.ignored_requests:
+                    is_message_processed = True
+                    self._serve_one(f, req_id)
 
             # Don't sleep unless there was no work available
             if not is_message_processed:
@@ -365,8 +367,16 @@ class Server(object):
                     (response_filename, str(e)))
             return
         finally:
-            # The request has been dealt with, even if we couldn't read it.
-            try_remove(request_filename)
+            # Try to clean up the request.  The request is considered "handled"
+            # even if something went wrong and we couldn't actually service it.
+            try:
+                os.remove(request_filename)
+            except OSError, e:
+                if e.errno != errno.ENOENT:
+                    self.log.info(
+                        'Unable to remove completed request %s; adding to ignore list.' %
+                        str(req_id))
+                    self.ignored_requests.add(req_id)
 
         self.pool.apply_async(handle_request, (), {
                 'request_bytes'     : request_bytes,
