@@ -115,27 +115,37 @@ def try_makedirs(directory):
         pass
 
 
-def fancy_rename(src, dst):
-    """Stupid Win32 os.rename() will not overwrite the destination."""
-    try_remove(dst)
-    os.rename(src, dst)
+def posixish_rename(src, dst):
+    """As os.rename(), but wth more consistent cross-platform behavior."""
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        # Stupid Win32 os.rename() refuses to overwrite the destination.
+        if e.errno == errno.EEXIST:
+            try_remove(dst)
+            os.rename(src, dst)
+        else:
+            raise
 
 
-def write_file_with_subdirs(filename, content):
-    """Write a file, creating any intermediate subdirectories."""
+def atomic_write_file(filename, content):
+    """Write a file, using a rename-from-tempfile pattern to present the
+    file to the consumer as an atomic operation.  Intermediate
+    subdirectories will be created as necessary.
+    """
     try_makedirs(os.path.dirname(filename))
-    
+
     # We don't want the recipient to see partial messages, so
     # we write to a tempfile and then rename when done.
     tmp_filename =  filename + PARTIAL_FILE_EXT
     with open(tmp_filename, 'wb') as f:
         f.write(content)
-    fancy_rename(tmp_filename, filename)
+    posixish_rename(tmp_filename, filename)
 
 
 def handle_request(**kwargs):
     """Handle a request.  (This function is invoked as the target for
-    multiprocessing.Process().)
+    multiprocessing.Pool.apply_async().)
 
     Keyword Arguments:
     ------------------
@@ -167,7 +177,7 @@ def handle_request(**kwargs):
     response_bytes = handler.process_request(request_bytes)
     if response_bytes:
         try:
-            write_file_with_subdirs(response_filename, response_bytes)
+            atomic_write_file(response_filename, response_bytes)
         except EnvironmentError as e:
             handle_request.log_queue.put(
                 'Unable to write response \"%s\": %s' % (response_filename, str(e)))
@@ -319,7 +329,7 @@ class Server(object):
                 (request_filename, str(e)))
             try:
                 if self.handler.io_error_response is not None:
-                    write_file_with_subdirs(response_filename, self.handler.io_error_response)
+                    atomic_write_file(response_filename, self.handler.io_error_response)
             except EnvironmentError as e:
                 self.log.error('Unable to write io_error_response \"%s\": %s' %
                     (response_filename, str(e)))
@@ -379,7 +389,7 @@ class Client(object):
         """
         request_id       = uuid.uuid1()
         request_filename = os.path.join(self.request_dir, make_msg_filename(request_id))
-        write_file_with_subdirs(request_filename, request_bytes)
+        atomic_write_file(request_filename, request_bytes)
         return request_id
 
 
