@@ -5,8 +5,11 @@ have access to a shared network filesystem, but have no useful communication lin
 Overview
 ========
 
-The ``spooky_rpc`` module is well-documented with Python docstrings, which should be considered
-the primary documentation.  This is just an overview.
+The `spooky_rpc module`_ is
+well-documented with Python docstrings, which should be considered the primary documentation.  This
+is just an overview.
+
+.. _spooky_rpc module: http://github.com/pelzlpj/spooky-rpc/blob/master/spooky_rpc.py
 
 **spooky-rpc** abstracts away most of the transport-layer details.  Your job is to define the
 following:
@@ -26,17 +29,21 @@ implement its interface, then instantiate a ``spooky_rpc.Server`` which uses you
 client-side code is fairly obvious; just invoke ``spooky_rpc.Client`` methods as necessary to send
 requests to the server and poll for arrival of responses.
 
-The unit tests in ``spooky_rpc.py`` provide a small example of usage.
+The unit tests in spooky_rpc.py_ provide a small example of usage.
+
+.. _spooky_rpc.py: http://github.com/pelzlpj/spooky-rpc/blob/master/spooky_rpc.py
 
 
 Things to Watch Out For
 =======================
 
-In order to facilitate request pipelining, ``spooky_rpc.Server`` uses the ``multiprocessing`` module
+In order to facilitate request pipelining, ``spooky_rpc.Server`` uses the multiprocessing_ module
 to hand off requests to a pool of child processes.  Consequently, the implementation of
 ``spooky_rpc.BinaryRequestHandler`` cannot assume that the process state will be maintained across
 multiple calls to the handler method.  If you need a stateful server, you will have to store that
 state outside of the process (e.g. on disk).
+
+.. _multiprocessing: http://docs.python.org/library/multiprocessing.html
 
 
 License
