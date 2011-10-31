@@ -89,7 +89,7 @@ def get_messages(path):
                 items.append( (f, uuid.UUID(hex=m.group(1)), st.st_mtime) )
             except OSError:
                 pass
-    items.sort(key=lambda (x, y, mtime): mtime)
+    items.sort(key=lambda item: item[2])
 
     return [(filename, id) for (filename, id, mtime) in items]
 
@@ -526,12 +526,12 @@ class Client(object):
 # UNIT TESTS
 ################################################################################
 
-REQ_NOOP   = '\x00'  # Ask server to do nothing
-REQ_PING   = '\x01'  # Ask server to immediately respond
-REQ_SLEEP3 = '\x02'  # Ask server to idle for 3 sec before responding
+REQ_NOOP   = b'\x00'  # Ask server to do nothing
+REQ_PING   = b'\x01'  # Ask server to immediately respond
+REQ_SLEEP3 = b'\x02'  # Ask server to idle for 3 sec before responding
 
-RESP_BAD_DATA = '\xfe'
-RESP_IO_ERROR = '\xff'
+RESP_BAD_DATA = b'\xfe'
+RESP_IO_ERROR = b'\xff'
 
 TEST_DIR = 'spooky_test_dir'
 
@@ -622,7 +622,7 @@ class SpookyTests(unittest.TestCase):
 
 if __name__ == '__main__':
     (major, minor, x, y, z) = sys.version_info
-    assert major == 2 and minor >= 7, 'Unit tests require Python 2.7.'
+    assert major > 2 or minor >= 7, 'Unit tests require Python 2.7.'
     unittest.main()
 
 

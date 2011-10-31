@@ -1,3 +1,4 @@
+*.swp
 *.pyc
 test-server.log
 spooky_test_dir
