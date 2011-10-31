@@ -60,6 +60,7 @@ Caveats
 import abc, errno, logging, multiprocessing, re, os, sys, time, unittest, uuid
 import Queue
 
+VERSION = '1.0.0'
 
 MESSAGE_FILE_EXT   = '.msg'
 PARTIAL_FILE_EXT   = '.part'

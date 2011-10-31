@@ -1,1 +1,4 @@
+*.pyc
 test-server.log
+dist
+MANIFEST
