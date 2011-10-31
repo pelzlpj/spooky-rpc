@@ -57,7 +57,7 @@ Caveats
   multiple calls to process_request().
 """
 
-import abc, errno, logging, multiprocessing, re, os, sys, time, unittest, uuid
+import abc, binascii, errno, logging, multiprocessing, re, os, sys, time, unittest, uuid
 import Queue
 
 VERSION = '1.0.0'
@@ -549,7 +549,7 @@ class TestHandler(BinaryRequestHandler):
             time.sleep(3.0)
             return REQ_SLEEP3
         else:
-            sys.stdout.write('received unhandled bytes: %s' % req.encode('hex'))
+            sys.stdout.write('received unhandled bytes: 0x%s' % binascii.hexlify(req))
             return RESP_BAD_DATA
 
     def io_error_response(self):
@@ -587,7 +587,7 @@ class SpookyTests(unittest.TestCase):
     def test_ping(self):
         response = self._client.send_request_wait(REQ_PING)
         self.assertEqual(response, REQ_PING,
-            msg=('unexpected response received from REQ_PING: 0x%s' % response.encode('hex')))
+            msg=('unexpected response received from REQ_PING: 0x%s' % binascii.hexlify(response)))
 
     def test_timeout_exceeded(self):
         req_id = self._client.send_request_nowait(REQ_SLEEP3)
@@ -597,12 +597,12 @@ class SpookyTests(unittest.TestCase):
         except TimeoutError:
             response = self._client.wait_response(req_id)
             self.assertEqual(response, REQ_SLEEP3,
-                msg=('unexpected response after REQ_SLEEP3: 0x%s' % response.encode('hex')))
+                msg=('unexpected response after REQ_SLEEP3: 0x%s' % binascii.hexlify(response)))
 
     def test_timeout_not_exceeded(self):
         response = self._client.send_request_wait(REQ_SLEEP3, 5.0)
         self.assertEqual(response, REQ_SLEEP3,
-            msg=('unexpected response after REQ_SLEEP3: 0x%s' % response.encode('hex')))
+            msg=('unexpected response after REQ_SLEEP3: 0x%s' % binascii.hexlify(response)))
 
     def test_concurrent_requests(self):
         # Eight concurrent requests, each of which should sleep for 3 sec
