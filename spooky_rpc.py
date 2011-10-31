@@ -58,7 +58,7 @@ Caveats
 """
 
 import abc, binascii, errno, logging, multiprocessing, re, os, sys, time, unittest, uuid
-import Queue
+import queue
 
 VERSION = '1.0.0'
 
@@ -168,7 +168,7 @@ def handle_request(**kwargs):
     if response_bytes:
         try:
             write_file_with_subdirs(response_filename, response_bytes)
-        except EnvironmentError, e:
+        except EnvironmentError as e:
             handle_request.log_queue.put(
                 'Unable to write response \"%s\": %s' % (response_filename, str(e)))
 
@@ -177,14 +177,12 @@ def init_subprocess(queue):
     handle_request.log_queue = queue
 
 
-class BinaryRequestHandler(object):
+class BinaryRequestHandler(object, metaclass=abc.ABCMeta):
     """This class shall be overridden to provide server-side logic for
     processing requests.  The interface requires that requests and responses are
     delivered in a binary format, so the implementation must take responsibility
     for the serialization/deserialization work.
     """
-
-    __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
     def process_request(self, req):
@@ -295,7 +293,7 @@ class Server(object):
                 while True:
                     subprocess_error = self.log_queue.get_nowait()
                     self.log.error(subprocess_error)
-            except Queue.Empty:
+            except queue.Empty:
                 pass
 
             is_message_processed = False
@@ -316,13 +314,13 @@ class Server(object):
         try:
             with open(request_filename, 'rb') as request_file:
                 request_bytes = request_file.read()
-        except EnvironmentError, e:
+        except EnvironmentError as e:
             self.log.error('Unable to read request \"%s\": %s' %
                 (request_filename, str(e)))
             try:
                 if self.handler.io_error_response is not None:
                     write_file_with_subdirs(response_filename, self.handler.io_error_response)
-            except EnvironmentError, e:
+            except EnvironmentError as e:
                 self.log.error('Unable to write io_error_response \"%s\": %s' %
                     (response_filename, str(e)))
             return
@@ -415,7 +413,7 @@ class Client(object):
                 response_bytes = f.read()
             try_remove(response_file)
             return response_bytes
-        except IOError, e:
+        except IOError as e:
             if e.errno == errno.ENOENT:
                 return None
             else:
