@@ -62,7 +62,7 @@ import queue
 
 VERSION = '1.0.0'
 
-MESSAGE_FILE_EXT   = '.msg'
+MESSAGE_FILE_EXT   = '.bin'
 PARTIAL_FILE_EXT   = '.part'
 MESSAGE_FILE_REGEX = re.compile(r'([0-9a-f]{32})' + re.escape(MESSAGE_FILE_EXT) + '$')
 PARTIAL_FILE_REGEX = re.compile(r'([0-9a-f]{32})' +
@@ -200,7 +200,7 @@ def handle_request(**kwargs):
     handler           = kwargs['handler']
 
     response_bytes = handler.process_request(request_bytes)
-    if response_bytes:
+    if response_bytes is not None:
         try:
             atomic_write_file(response_filename, response_bytes)
         except EnvironmentError as e:
@@ -457,11 +457,24 @@ class Client(object):
         -------
         EnvironmentError, if a response file is available but cannot be read.
         """
-        response_file = os.path.join(self.response_dir, make_msg_filename(request_id))
+        response_file    = make_msg_filename(request_id)
+        fq_response_file = os.path.join(self.response_dir, response_file)
+
+        # Note: workaround for WebDAV implementation on at least some versions
+        # of Windows Server.  Attempting to open the file without first listing
+        # the directory can cause the file to become unavailable for about 60
+        # sec (file shows up in directory listing, but stat() and open() both
+        # fail).
         try:
-            with open(response_file, 'rb') as f:
+            if response_file not in os.listdir(self.response_dir):
+                return None
+        except OSError:
+            return None
+
+        try:
+            with open(fq_response_file, 'rb') as f:
                 response_bytes = f.read()
-            try_remove(response_file)
+            try_remove(fq_response_file)
             return response_bytes
         except IOError as e:
             if e.errno == errno.ENOENT:
