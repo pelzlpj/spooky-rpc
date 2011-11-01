@@ -62,7 +62,7 @@ import Queue
 
 VERSION = '1.0.0'
 
-MESSAGE_FILE_EXT   = '.msg'
+MESSAGE_FILE_EXT   = '.bin'
 PARTIAL_FILE_EXT   = '.part'
 MESSAGE_FILE_REGEX = re.compile(r'([0-9a-f]{32})' + re.escape(MESSAGE_FILE_EXT) + '$')
 PARTIAL_FILE_REGEX = re.compile(r'([0-9a-f]{32})' +
