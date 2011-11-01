@@ -200,7 +200,7 @@ def handle_request(**kwargs):
     handler           = kwargs['handler']
 
     response_bytes = handler.process_request(request_bytes)
-    if response_bytes:
+    if response_bytes is not None:
         try:
             atomic_write_file(response_filename, response_bytes)
         except EnvironmentError, e:
