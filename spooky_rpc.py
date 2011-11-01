@@ -439,8 +439,7 @@ class Client(object):
         """Check whether a response is available for the given request id.
 
         Note: if a response is successfully retrieved, then the request_id is
-        invalidated.  (Request identifiers are not guaranteed to be unique
-        across the program lifetime.)
+        invalidated.
 
         Parameters:
         -----------
