@@ -2,9 +2,10 @@
 filesystem transport.  It may prove useful in restricted network environments where multiple PCs
 have access to a shared network filesystem, but have no useful communication link otherwise.
 
-The source targets Python 2.6+, but there is a working `port to Python 3`_ generated via ``2to3``.
+This source targets Python 3, and is automatically generated from the `Python 2.x code`_ using
+``2to3``.
 
-.. _port to Python 3: http://github.com/pelzlpj/spooky-rpc/tree/py3
+.. _Python 2.x code: http://github.com/pelzlpj/spooky-rpc
 
 
 Overview
