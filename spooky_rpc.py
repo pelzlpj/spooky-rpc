@@ -170,7 +170,7 @@ def atomic_write_file(filename, content):
 
 def handle_request(**kwargs):
     """Handle a request.  (This function is invoked as the target for
-    multiprocessing.Pool.apply_async().)
+    multiprocessing.Process().)
 
     Keyword Arguments:
     ------------------
@@ -186,25 +186,23 @@ def handle_request(**kwargs):
 
         Client code for handling the request.
 
-    Attributes:
-    -----------
     log_queue : multiprocessing.Queue
 
-        Queue to which error strings should be sent.  (This is a hack.  When
-        using multiprocess.Pool, queues cannot be passed as function arguments;
-        they must be passed in the process initializer.)
+        Queue to which error strings should be sent.  (The parent process
+        writes these strings into its log.)
 
     """
     request_bytes     = kwargs['request_bytes']
     response_filename = kwargs['response_filename']
     handler           = kwargs['handler']
+    log_queue         = kwargs['log_queue']
 
     response_bytes = handler.process_request(request_bytes)
     if response_bytes is not None:
         try:
             atomic_write_file(response_filename, response_bytes)
         except EnvironmentError, e:
-            handle_request.log_queue.put(
+            log_queue.put(
                 'Unable to write response \"%s\": %s' % (response_filename, str(e)))
 
 
@@ -261,7 +259,7 @@ class BinaryRequestHandler(object):
 
 class Server(object):
 
-    def __init__(self, process_count=None, **kwargs):
+    def __init__(self, max_processes=16, **kwargs):
         """Construct a new server instance.
 
         Keyword Arguments:
@@ -270,7 +268,7 @@ class Server(object):
 
             Provides the method for examining a binary request packet and taking
             action based on its content.
- 
+
         directory : string
 
             Directory used for request and response storage.
@@ -279,16 +277,15 @@ class Server(object):
 
             Location where log file should be stored.
 
-        process_count : int or None
-            
-            If provided, this is the count of subprocesses to use to service
-            requests.  The default is to use the CPU count.
+        max_processes : int
+
+            Maximum number of subprocesses to use to service requests.
         """
         self.handler       = kwargs['handler']
         self.request_dir   = os.path.join(kwargs['directory'], REQUEST_SUBDIR)
         self.response_dir  = os.path.join(kwargs['directory'], RESPONSE_SUBDIR)
         self.log_filename  = kwargs['log_filename']
-        self.process_count = process_count
+        self.max_processes = max_processes
 
         assert isinstance(self.handler, BinaryRequestHandler)
 
@@ -321,11 +318,7 @@ class Server(object):
             try_remove(os.path.join(self.response_dir, msg_filename))
 
         self.log_queue = multiprocessing.Queue()
-        self.pool = multiprocessing.Pool(
-            processes=self.process_count,
-            initializer=init_subprocess,
-            initargs=(self.log_queue,))
-
+        self.procs = set()
         self.ignored_requests = set()
 
         while True:
@@ -336,10 +329,17 @@ class Server(object):
                     self.log.error(subprocess_error)
             except Queue.Empty:
                 pass
+            
+            # See if any child processes have terminated
+            procs_copy = self.procs.copy()
+            for proc in procs_copy:
+                if not proc.is_alive():
+                    proc.join()
+                    self.procs.remove(proc)
 
             is_message_processed = False
             for (f, req_id) in get_messages(self.request_dir):
-                if req_id not in self.ignored_requests:
+                if len(self.procs) < self.max_processes and req_id not in self.ignored_requests:
                     is_message_processed = True
                     self._serve_one(f, req_id)
 
@@ -378,11 +378,14 @@ class Server(object):
                         str(req_id))
                     self.ignored_requests.add(req_id)
 
-        self.pool.apply_async(handle_request, (), {
+        proc = multiprocessing.Process(target=handle_request, kwargs={
                 'request_bytes'     : request_bytes,
                 'response_filename' : response_filename,
                 'handler'           : self.handler,
-            })
+                'log_queue'         : self.log_queue
+                })
+        self.procs.add(proc)
+        proc.start()
 
 
 
@@ -648,7 +651,7 @@ def start_test_server():
         handler=TestHandler(),
         directory=TEST_DIR,
         log_filename='test-server.log',
-        process_count=16)
+        max_processes=10)
     server.serve()
 
 

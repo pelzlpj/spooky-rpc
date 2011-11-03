@@ -43,10 +43,12 @@ Things to Watch Out For
 =======================
 
 In order to facilitate request pipelining, ``spooky_rpc.Server`` uses the multiprocessing_ module
-to hand off requests to a pool of child processes.  Consequently, the implementation of
+to hand off requests to child processes.  Consequently, the implementation of
 ``spooky_rpc.BinaryRequestHandler`` cannot assume that the process state will be maintained across
 multiple calls to the handler method.  If you need a stateful server, you will have to store that
-state outside of the process (e.g. on disk).
+state outside of the process (e.g. on disk).  In addition, the request handler must satisfy
+the requirements of the ``multiprocessing`` module (roughly speaking, any program state which is
+visible to the request handler must be pickle-able).
 
 .. _multiprocessing: http://docs.python.org/library/multiprocessing.html
 
