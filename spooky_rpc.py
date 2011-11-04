@@ -213,10 +213,6 @@ def handle_request(**kwargs):
                 'Unable to write response \"%s\": %s' % (response_filename, str(e)))
 
 
-def init_subprocess(queue):
-    handle_request.log_queue = queue
-
-
 class BinaryRequestHandler(object):
     """This class shall be overridden to provide server-side logic for
     processing requests.  The interface requires that requests and responses are
