@@ -197,7 +197,14 @@ def handle_request(**kwargs):
     handler           = kwargs['handler']
     log_queue         = kwargs['log_queue']
 
-    response_bytes = handler.process_request(request_bytes)
+    try:
+        response_bytes = handler.process_request(request_bytes)
+    except Exception, e:
+        # BinaryRequestHandler.process_request() requires that "exceptions
+        # shall not be raised."  Go forth and fix thy code.
+        log_queue.put('Unhandled exception raised in process_request(): %s' % str(e))
+        raise
+
     if response_bytes is not None:
         try:
             atomic_write_file(response_filename, response_bytes)
